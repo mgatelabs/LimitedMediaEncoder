@@ -183,7 +183,7 @@ def encode_result(ticket_id):
     def cleanup(response):
         # Delay slightly to ensure file handles are released (especially on Windows)
         def delayed_cleanup():
-            time.sleep(1)
+            time.sleep(5)
             try:
                 shutil.rmtree(folder, ignore_errors=True)
                 JOBS.pop(ticket_id, None)
