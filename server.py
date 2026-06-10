@@ -124,7 +124,7 @@ def job_worker():
                 if not line:
                     break
 
-                print(line)
+                #print(line)
                 if line.startswith("out_time_ms="):
                     out_time_ms = int(line.split("=")[1])
 
