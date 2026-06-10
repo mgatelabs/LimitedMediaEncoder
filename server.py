@@ -17,11 +17,27 @@ app = Flask(__name__)
 # -------------------------------
 BASE_DIR = Path(os.getcwd())
 TEMP_DIR = BASE_DIR / "temp"
+shutil.rmtree(TEMP_DIR, ignore_errors=True)
 TEMP_DIR.mkdir(exist_ok=True)
 JOBS = {}  # job_id -> {"status": str, "folder": Path, "output_file": Path | None, "error": str | None, "worker": str | None}
 JOB_QUEUE = queue.Queue()
 PROCESSING_THREAD = None
 
+def get_duration(path):
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_format",
+            str(path)
+        ],
+        capture_output=True,
+        text=True
+    )
+
+    data = json.loads(result.stdout)
+    return float(data["format"]["duration"])
 
 # -------------------------------
 # Job Processor
@@ -45,6 +61,10 @@ def job_worker():
         srt_file = folder / "input.srt"
         output_file = folder / "output.mp4"
 
+        # Store a reference
+        job['input_file'] = input_file
+        job['output_file'] = output_file
+
         # Load options
         options_file = folder / "options.json"
         with open(options_file, "r") as f:
@@ -59,7 +79,6 @@ def job_worker():
         if not os.path.exists(srt_file):
             vf_arg = "scale='min(3840,iw)':-2"
         else:
-
             srt_path = Path(srt_file).resolve()
 
             # Escape special chars for ffmpeg filter syntax
@@ -72,30 +91,70 @@ def job_worker():
             "-y",
             "-i", str(input_file),
             "-vf", vf_arg,
+            "-loglevel", "error",
             "-c:v", "libx264",
+            "-progress", "pipe:1",
+            "-nostats",
             "-preset", ffmpeg_preset,
             "-profile:v", "high",
             "-level", "4.2",
-            "-pix_fmt", "yuv420p",
-            "-crf", crf,
             "-movflags", "+faststart",
             "-c:a", "aac",
             "-b:a", f"{audio_bitrate}k",
             "-ac", channels,
             str(output_file)
         ]
-
         print(command)
 
         try:
-            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if result.returncode == 0:
+            #result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+            proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True
+            )
+
+            duration = get_duration(input_file)
+
+            for line in proc.stdout:
+                line = line.strip()
+
+                if not line:
+                    break
+
+                print(line)
+                if line.startswith("out_time_ms="):
+                    out_time_ms = int(line.split("=")[1])
+
+                    progress = min(
+                        out_time_ms / (duration * 1_000_000),
+                        1.0
+                    )
+
+                    job["progress"] = progress
+
+                elif line == "progress=end":
+                    job["progress"] = 1.0
+                    job["status"] = "done"
+
+            return_code = proc.wait()
+
+            if return_code == 0:
                 job["status"] = "done"
                 job["output_file"] = output_file
             else:
-                print(result.stderr)
                 job["status"] = "failed"
-                job["error"] = result.stderr
+
+            # if result.returncode == 0:
+            #     job["status"] = "done"
+            #     job["output_file"] = output_file
+            # else:
+            #     print(result.stderr)
+            #     job["status"] = "failed"
+            #     job["error"] = result.stderr
+
         except Exception as e:
             job["status"] = "failed"
             job["error"] = str(e)
@@ -140,6 +199,7 @@ def encode_start():
         # Create job entry
         JOBS[ticket_id] = {
             "status": "queued",
+            "progress": 0.0,
             "folder": job_folder,
             "output_file": None,
             "error": None,
@@ -159,9 +219,35 @@ def encode_status(ticket_id):
     if not job:
         return jsonify({"error": "Invalid ticket"}), 404
 
+    # progress = 0.0
+
+    # if job['status'] == 'processing':
+    #     pass
+    #     # input_file = job['input_file']
+    #     # output_file = job['output_file']
+    #
+    #     # try:
+    #     #     input_size = os.path.getsize(input_file)
+    #     #
+    #     #     if input_size > 0 and os.path.exists(output_file):
+    #     #         output_size = os.path.getsize(output_file)
+    #     #
+    #     #         # Ratio-based progress estimate
+    #     #         progress = output_size / input_size
+    #     #
+    #     #         # Clamp to [0.0, 1.0]
+    #     #         progress = max(0.0, min(progress, 1.0))
+    #     # except (OSError, IOError):
+    #     #     # File may be temporarily unavailable; leave progress as-is
+    #     #     pass
+    #
+    # elif job["status"] == "completed":
+    #     progress = 1.0
+
     return jsonify({
         "ticket_id": ticket_id,
         "status": job["status"],
+        "progress": str(round(job["progress"] * 100, 2)),
         "worker": job.get("worker"),
         "error": job.get("error")
     })
