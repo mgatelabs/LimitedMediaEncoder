@@ -1,5 +1,7 @@
 import json
+import logging
 import os
+import platform
 import queue
 import shutil
 import subprocess
@@ -8,8 +10,15 @@ import time
 import uuid
 from pathlib import Path
 
-from flask import Flask, request, jsonify, send_file, after_this_request
+# Enable VT100/ANSI processing on Windows 10+
+if platform.system() == 'Windows':
+    import msvcrt
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
 
+
+from flask import Flask, request, jsonify, send_file, after_this_request
 app = Flask(__name__)
 
 # -------------------------------
@@ -21,6 +30,8 @@ shutil.rmtree(TEMP_DIR, ignore_errors=True)
 TEMP_DIR.mkdir(exist_ok=True)
 
 JOBS_LOCK = threading.Lock()
+ACTIVE_WORKERS = set()
+RECENTLY_COMPLETED = {}  # ticket_id -> (job, timestamp) for 10s after completion
 
 FFMPEG_CONFIG = {
     "resolution": 3840,
@@ -33,15 +44,8 @@ FFMPEG_CONFIG = {
 JOBS = {}
 JOB_QUEUE = queue.Queue()
 
+
 def get_duration(path):
-    """Measure the duration of a media file using ffprobe.
-
-    Args:
-        path (Path): Path to the input media file.
-
-    Returns:
-        float: Duration of the video in seconds.
-    """
     result = subprocess.run(
         [
             "ffprobe",
@@ -57,11 +61,11 @@ def get_duration(path):
     data = json.loads(result.stdout)
     return float(data["format"]["duration"])
 
+
 # -------------------------------
 # Job Processor
 # -------------------------------
 def job_worker():
-    """Background thread: process one job at a time."""
     while True:
         ticket_id = JOB_QUEUE.get()
         with JOBS_LOCK:
@@ -69,14 +73,16 @@ def job_worker():
         if not job:
             continue
 
-        print(f'Working on {ticket_id}')
+        job["worker_name"] = threading.current_thread().name
+        job["status"] = "active"
+        ACTIVE_WORKERS.add(threading.current_thread().name)
+        #print(f'Working on {ticket_id}')
 
         folder = job["folder"]
         input_file = folder / "input_file"
         srt_file = folder / "input.srt"
         output_file = folder / "output.mp4"
 
-        # Load options
         options_file = folder / "options.json"
         with open(options_file, "r") as f:
             options = json.load(f)
@@ -114,7 +120,7 @@ def job_worker():
             str(output_file)
         ]
 
-        print(f'Encoding {input_file} -> {output_file}')
+        #print(f'Encoding {input_file} -> {output_file}')
 
         try:
             proc = subprocess.Popen(
@@ -151,23 +157,27 @@ def job_worker():
                     job["status"] = "failed"
                     job["error"] = str(captured_stderr).strip() if captured_stderr else "Unknown FFmpeg error"
 
+                # Clean up active workers tracking
+                worker_name = threading.current_thread().name
+                if job["worker_name"] == worker_name:
+                    ACTIVE_WORKERS.discard(worker_name)
+
         except Exception as e:
             with JOBS_LOCK:
                 job["status"] = "failed"
                 job["error"] = str(e)
+            ACTIVE_WORKERS.discard(threading.current_thread().name)
 
         JOB_QUEUE.task_done()
 
 
 @app.route("/encode/start", methods=["POST"])
 def encode_start():
-    """Start a new encoding job."""
     try:
         ticket_id = str(uuid.uuid4())
         job_folder = TEMP_DIR / ticket_id
         job_folder.mkdir(parents=True, exist_ok=True)
 
-        # Save input file(s)
         input_file = request.files.get("input_file")
         if not input_file:
             return jsonify({"error": "Missing input_file"}), 400
@@ -180,25 +190,28 @@ def encode_start():
             srt_path = job_folder / "input.srt"
             srt_file.save(srt_path)
 
-        # Save JSON options
         options_raw = request.form.get("options", "{}")
         try:
             options = json.loads(options_raw)
         except json.JSONDecodeError:
             options = {}
+
         with open(job_folder / "options.json", "w") as f:
             json.dump(options, f, indent=2)
 
-        # Create job entry under lock
+        job_id_short = ticket_id[:8]
+        start_time = time.time()
+
         with JOBS_LOCK:
             JOBS[ticket_id] = {
                 "status": "queued",
-                "progress": 0.0,
+                "progress": None,
                 "folder": job_folder,
                 "output_file": None,
                 "error": None,
-                "worker": None,
                 "worker_name": None,
+                "job_id_short": job_id_short,
+                "start_time": start_time,
             }
 
         JOB_QUEUE.put(ticket_id)
@@ -220,7 +233,7 @@ def encode_status(ticket_id):
     response = {
         "ticket_id": ticket_id,
         "status": status,
-        "worker": job.get("worker_name") or job.get("worker"),
+        "worker": job.get("worker_name"),
     }
 
     if progress is not None:
@@ -264,9 +277,10 @@ def encode_result(ticket_id):
                 shutil.rmtree(output_path, ignore_errors=True)
                 with JOBS_LOCK:
                     JOBS.pop(ticket_id, None)
-                    print(f"[CLEANUP] Removed {output_path}")
+                    #print(f"[CLEANUP] Removed {output_path}")
             except Exception as e:
-                print(f"[CLEANUP ERROR] {e}")
+                pass
+                #print(f"[CLEANUP ERROR] {e}")
 
         threading.Thread(target=delayed_cleanup, daemon=True).start()
         return response
@@ -279,14 +293,133 @@ def encode_result(ticket_id):
 
 
 # -------------------------------
+# Console Status Monitor
+# -------------------------------
+def clear_console():
+    """Clear terminal and reposition cursor to line 1."""
+    print('\033[H\033[J', end='')
+
+
+ASCII_LOGO = """
+░██         ░██                ░██   ░██                      ░██    ░███     ░███                   ░██ ░██           
+░██                                  ░██                      ░██    ░████   ░████                   ░██               
+░██         ░██░█████████████  ░██░████████  ░███████   ░████████    ░██░██ ░██░██  ░███████   ░████████ ░██ ░██████   
+░██         ░██░██   ░██   ░██ ░██   ░██    ░██    ░██ ░██    ░██    ░██ ░████ ░██ ░██    ░██ ░██    ░██ ░██      ░██  
+░██         ░██░██   ░██   ░██ ░██   ░██    ░█████████ ░██    ░██    ░██  ░██  ░██ ░█████████ ░██    ░██ ░██ ░███████  
+░██         ░██░██   ░██   ░██ ░██   ░██    ░██        ░██   ░███    ░██       ░██ ░██        ░██   ░███ ░██░██   ░██  
+░██████████ ░██░██   ░██   ░██ ░██    ░████  ░███████   ░█████░██    ░██       ░██  ░███████   ░█████░██ ░██ ░█████░██ 
+                                                                                                                       
+                                                                                                                       
+                                                                                                                       
+░██████████                                         ░██                                                                
+░██                                                 ░██                                                                
+░██         ░████████   ░███████   ░███████   ░████████  ░███████  ░██░████                                            
+░█████████  ░██    ░██ ░██    ░██ ░██    ░██ ░██    ░██ ░██    ░██ ░███                                                
+░██         ░██    ░██ ░██        ░██    ░██ ░██    ░██ ░█████████ ░██                                                 
+░██         ░██    ░██ ░██    ░██ ░██    ░██ ░██   ░███ ░██        ░██                                                 
+░██████████ ░██    ░██  ░███████   ░███████   ░█████░██  ░███████  ░██                                                 
+"""
+
+LEGAL = """
+ Limited Media Encoder
+ Licensed under MIT | github.com/mgatelabs/LimitedMediaEncoder"""
+
+
+def print_banner():
+    print(ASCII_LOGO + RESET)
+    print('\033[90m' + LEGAL + '\033[0m')
+    time.sleep(2)
+    clear_console()
+
+
+STATUS_COLORS = {
+    'active': '\033[92m',
+    'queued': '\033[93m',
+    'done':   '\033[94m',
+    'failed': '\033[91m',
+}
+
+RESET = '\033[0m'
+
+
+def elapsed_str(start_time):
+    mins, secs = divmod(int(time.time() - start_time), 60)
+    return f'{mins:02d}:{secs:02d}'
+
+
+def draw_bar(pct, width=15):
+    filled = int(pct * width)
+    return '[' + '=' * filled + ' ' * (width - filled) + ']'
+
+
+def status_monitor():
+    while True:
+        # Check for Escape key at the top of each iteration
+        if msvcrt.kbhit():
+            key = msvcrt.getch()
+            if key == b'\x1b':  # Escape
+                print('\n[INFO] Shutting down via Escape key...')
+                os._exit(0)
+
+        time.sleep(2.0)
+
+        with JOBS_LOCK:
+            active_jobs = [(tid, j) for tid, j in JOBS.items() if j['status'] == 'active']
+            queued_jobs = [(tid, j) for tid, j in JOBS.items() if j['status'] == 'queued']
+            done_jobs = [(tid, j) for tid, j in JOBS.items() if j['status'] == 'done']
+            failed_jobs = [(tid, j) for tid, j in JOBS.items() if j['status'] == 'failed']
+
+            n_active = len(active_jobs)
+            n_queued = len(queued_jobs)
+            n_done = len(done_jobs)
+            n_failed = len(failed_jobs)
+
+            job_list = []
+            for tid, j in active_jobs + queued_jobs:
+                status_color = STATUS_COLORS.get(j['status'], RESET)
+                worker = j['worker_name'] or '-'
+                short = j.get('job_id_short', tid[:8])
+                progress = j.get('progress')
+                
+                if progress is None:
+                    prog_str = '...'
+                    bar = '─' * 16
+                    elapsed = '    --  '
+                else:
+                    pct = min(progress * 100, 100)
+                    prog_str = f'{pct:5.1f}%'
+                    bar = draw_bar(progress)
+                    t_start = j.get('start_time') or time.time()
+                    elapsed = elapsed_str(t_start)
+
+                job_list.append((status_color, short, worker, status_color.upper(), bar, prog_str, elapsed))
+
+        clear_console()
+
+        print(f'🎬 Server {time.strftime("%H:%M:%S")} | Active: {n_active}  Queued: {n_queued}  Done: {n_done}  Failed: {n_failed}')
+
+        if job_list:
+            for color, short, worker, status, bar, prog_str, elapsed in job_list:
+                print(f'{status.lower():<6}[{bar}]  {short} ({worker:<10})  {prog_str:>7s}  {elapsed}')
+        else:
+            print('   (idle)')
+
+
+# -------------------------------
 # App Startup
 # -------------------------------
 def main(port: int = 8080, num_workers: int = 3):
-    """Start Flask app and N worker threads."""
     for i in range(num_workers):
         t = threading.Thread(target=job_worker, daemon=True, name=f"JobWorker-{i + 1}")
         t.start()
-        print(f"[INFO] Started worker thread {t.name}")
+
+    print_banner()
+    
+    mon = threading.Thread(target=status_monitor, daemon=True, name='StatusMonitor')
+    mon.start()
+    print('[INFO] Status monitor started')
+
+    logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
