@@ -20,6 +20,8 @@ if platform.system() == 'Windows':
 
 from flask import Flask, request, jsonify, send_file, after_this_request
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024 * 1024  # 20 GB hard limit
+app.request_class.max_form_memory_size = 0  # spool every upload part to disk immediately
 
 # -------------------------------
 # Configuration
@@ -270,11 +272,11 @@ def encode_result(ticket_id):
 
     @after_this_request
     def cleanup(response):
-        output_path = output_file
+        cleanup_folder = folder
         def delayed_cleanup():
             time.sleep(10)
             try:
-                shutil.rmtree(output_path, ignore_errors=True)
+                shutil.rmtree(cleanup_folder, ignore_errors=True)
                 with JOBS_LOCK:
                     JOBS.pop(ticket_id, None)
                     #print(f"[CLEANUP] Removed {output_path}")
