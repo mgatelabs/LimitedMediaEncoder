@@ -1,10 +1,10 @@
 import json
 import logging
+import logging.handlers
 import os
 import platform
 import queue
 import shutil
-import subprocess
 import threading
 import time
 import uuid
@@ -18,10 +18,12 @@ if platform.system() == 'Windows':
     kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
 
 
+import handlers
+
 from flask import Flask, request, jsonify, send_file, after_this_request
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024 * 1024  # 20 GB hard limit
-app.request_class.max_form_memory_size = 0  # spool every upload part to disk immediately
+app.config["MAX_CONTENT_LENGTH"] = None  # disable upload limit entirely
+app.request_class.max_form_memory_size = None  # allow unlimited multi-part uploads to disk
 
 # -------------------------------
 # Configuration
@@ -35,38 +37,14 @@ JOBS_LOCK = threading.Lock()
 ACTIVE_WORKERS = set()
 RECENTLY_COMPLETED = {}  # ticket_id -> (job, timestamp) for 10s after completion
 
-FFMPEG_CONFIG = {
-    "resolution": 3840,
-    "codec": "libx264",
-    "audio_codec": "aac",
-    "profile": "high",
-    "level": "4.2",
-}
-
 JOBS = {}
-JOB_QUEUE = queue.Queue()
-
-
-def get_duration(path):
-    result = subprocess.run(
-        [
-            "ffprobe",
-            "-v", "quiet",
-            "-print_format", "json",
-            "-show_format",
-            str(path)
-        ],
-        capture_output=True,
-        text=True
-    )
-
-    data = json.loads(result.stdout)
-    return float(data["format"]["duration"])
-
 
 # -------------------------------
 # Job Processor
 # -------------------------------
+JOB_QUEUE = queue.Queue()
+
+
 def job_worker():
     while True:
         ticket_id = JOB_QUEUE.get()
@@ -78,100 +56,21 @@ def job_worker():
         job["worker_name"] = threading.current_thread().name
         job["status"] = "active"
         ACTIVE_WORKERS.add(threading.current_thread().name)
-        #print(f'Working on {ticket_id}')
 
         folder = job["folder"]
-        input_file = folder / "input_file"
-        srt_file = folder / "input.srt"
-        output_file = folder / "output.mp4"
-
-        options_file = folder / "options.json"
-        with open(options_file, "r") as f:
-            options = json.load(f)
-
-        ffmpeg_preset = options.get("ffmpeg_preset", "medium")
-        stereo = options.get("stereo", True)
-        audio_bitrate = str(options.get("audio_bitrate", 128))
-        channels = "2" if stereo else "1"
-        resolution = FFMPEG_CONFIG["resolution"]
-
-        vf_res = f"min({resolution},iw)"
-        if os.path.exists(srt_file):
-            srt_path = Path(srt_file).resolve()
-            srt_escaped = str(srt_path).replace("\\", "\\\\").replace(":", "\\:")
-            vf_arg = f"scale='{vf_res}':-2,subtitles='{srt_escaped}'"
-        else:
-            vf_arg = f"scale='{vf_res}':-2"
-
-        command = [
-            "ffmpeg",
-            "-y",
-            "-i", str(input_file),
-            "-vf", vf_arg,
-            "-loglevel", "error",
-            "-c:v", FFMPEG_CONFIG["codec"],
-            "-progress", "pipe:1",
-            "-nostats",
-            "-preset", ffmpeg_preset,
-            "-profile:v", FFMPEG_CONFIG["profile"],
-            "-level", str(FFMPEG_CONFIG["level"]),
-            "-movflags", "+faststart",
-            "-c:a", FFMPEG_CONFIG["audio_codec"],
-            "-b:a", f"{audio_bitrate}k",
-            "-ac", channels,
-            str(output_file)
-        ]
-
-        #print(f'Encoding {input_file} -> {output_file}')
+        
+        files = {
+            "video": str(folder / "input_file"),
+            "options": str(folder / "options.json"),
+        }
+        if os.path.exists(folder / "input.srt"):
+            files["srt"] = str(folder / "input.srt")
 
         try:
-            proc = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True
-            )
-
-            duration = get_duration(input_file)
-
-            for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                if line.startswith("out_time_ms="):
-                    out_time_ms = int(line.split("=")[1])
-                    if duration > 0:
-                        progress = min(out_time_ms / (duration * 1_000_000), 1.0)
-                        with JOBS_LOCK:
-                            job["progress"] = progress
-                elif line == "progress=end":
-                    with JOBS_LOCK:
-                        job["progress"] = 1.0
-
-            return_code = proc.wait()
-
-            with JOBS_LOCK:
-                if return_code == 0 and os.path.exists(output_file):
-                    job["status"] = "done"
-                    job["output_file"] = output_file
-                else:
-                    captured_stderr = proc.stdout.getvalue() if hasattr(proc, 'stdout') and hasattr(proc.stdout, 'getvalue') else None
-                    job["status"] = "failed"
-                    job["error"] = str(captured_stderr).strip() if captured_stderr else "Unknown FFmpeg error"
-
-                # Clean up active workers tracking
-                worker_name = threading.current_thread().name
-                if job["worker_name"] == worker_name:
-                    ACTIVE_WORKERS.discard(worker_name)
-
-        except Exception as e:
-            with JOBS_LOCK:
-                job["status"] = "failed"
-                job["error"] = str(e)
-            ACTIVE_WORKERS.discard(threading.current_thread().name)
-
-        JOB_QUEUE.task_done()
-
+            handler = handlers.create_handler(job["task_type"], ticket_id)
+            handler.execute(files, job, JOBS_LOCK)
+        finally:
+            JOB_QUEUE.task_done()
 
 @app.route("/encode/start", methods=["POST"])
 def encode_start():
@@ -180,17 +79,22 @@ def encode_start():
         job_folder = TEMP_DIR / ticket_id
         job_folder.mkdir(parents=True, exist_ok=True)
 
+        logging.warning(f"[encode_start] New job created | ticket_id={ticket_id} folder={job_folder}")
+
         input_file = request.files.get("input_file")
         if not input_file:
             return jsonify({"error": "Missing input_file"}), 400
 
         input_path = job_folder / "input_file"
         input_file.save(input_path)
+        file_size = input_path.stat().st_size
+        logging.warning(f"[encode_start] Input received | filename={input_file.filename} size={file_size}")
 
         srt_file = request.files.get("srt_file")
         if srt_file:
             srt_path = job_folder / "input.srt"
             srt_file.save(srt_path)
+            logging.warning(f"[encode_start] SRT received | filename={srt_file.filename}")
 
         options_raw = request.form.get("options", "{}")
         try:
@@ -206,6 +110,8 @@ def encode_start():
 
         with JOBS_LOCK:
             JOBS[ticket_id] = {
+                "ticket_id": ticket_id,
+                "task_type": "ENCODE",
                 "status": "queued",
                 "progress": None,
                 "folder": job_folder,
@@ -220,6 +126,7 @@ def encode_start():
         return jsonify({"ticket_id": ticket_id, "status": "queued"})
 
     except Exception as e:
+        logging.exception(e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -263,11 +170,13 @@ def encode_result(ticket_id):
     with JOBS_LOCK:
         job = dict(JOBS.get(ticket_id, {}))
         if not job or "status" not in job or job["status"] != "done":
+            logging.warning(f"[encode_result] Invalid request | ticket_id={ticket_id} status={job.get('status', 'N/A')}")
             return jsonify({"error": "Job not completed"}), 400
 
         output_file = job.get("output_file")
         folder = job.get("folder")
         if not output_file or not folder:
+            logging.warning(f"[encode_result] Missing data | ticket_id={ticket_id} output_file={output_file}")
             return jsonify({"error": "Job not completed"}), 400
 
     @after_this_request
@@ -349,9 +258,15 @@ def elapsed_str(start_time):
     return f'{mins:02d}:{secs:02d}'
 
 
-def draw_bar(pct, width=15):
+SPINNER_FRAMES = ['⠋', '⠙', '⠸', '⠰', '⠴', '⠲']
+_spinner_frame = 0
+
+def draw_bar(pct, width=30, frame_off=0):
     filled = int(pct * width)
-    return '[' + '=' * filled + ' ' * (width - filled) + ']'
+    if filled >= width:
+        return '[' + '=' * filled + ']'
+    fi = (_spinner_frame + frame_off) % len(SPINNER_FRAMES)
+    return '[' + '=' * filled + SPINNER_FRAMES[fi] + ' ' * (width - filled - 1) + ']'
 
 
 def status_monitor():
@@ -410,7 +325,27 @@ def status_monitor():
 # -------------------------------
 # App Startup
 # -------------------------------
+def setup_logging(base_dir):
+    log_file = base_dir / "server.log"
+    log1_file = base_dir / "server1.log"
+
+    # Rotate: erase old server1.log, rename current to server1.log
+    if log1_file.exists():
+        os.remove(log1_file)
+    if log_file.exists():
+        log_file.rename(log1_file)
+
+    fmt = logging.Formatter('[%(asctime)s] %(levelname)s - %(name)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+    handler_current = logging.FileHandler(log_file, mode='w')
+    handler_current.setLevel(logging.WARNING)
+    handler_current.setFormatter(fmt)
+    logging.getLogger().setLevel(logging.WARNING)
+    logging.getLogger().addHandler(handler_current)
+
 def main(port: int = 8080, num_workers: int = 3):
+    setup_logging(BASE_DIR)
+
     for i in range(num_workers):
         t = threading.Thread(target=job_worker, daemon=True, name=f"JobWorker-{i + 1}")
         t.start()
@@ -419,7 +354,7 @@ def main(port: int = 8080, num_workers: int = 3):
     
     mon = threading.Thread(target=status_monitor, daemon=True, name='StatusMonitor')
     mon.start()
-    print('[INFO] Status monitor started')
+    logging.warning('[INFO] Status monitor started')
 
     logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
@@ -432,5 +367,27 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Simple Flask-based encoding server")
     parser.add_argument("--port", type=int, default=8080, help="Port to run the server on")
     parser.add_argument("--workers", type=int, default=3, help="Number of background encoding threads")
+    parser.add_argument("--test", action="store_true", help="Create a simulated test task for progress/status testing")
     args = parser.parse_args()
+    
+    if args.test:
+        ticket_id = str(uuid.uuid4())
+        job_folder = TEMP_DIR / ticket_id
+        job_folder.mkdir(parents=True, exist_ok=True)
+        with JOBS_LOCK:
+            JOBS[ticket_id] = {
+                "ticket_id": ticket_id,
+                "task_type": "TEST",
+                "status": "queued",
+                "progress": None,
+                "folder": job_folder,
+                "output_file": None,
+                "error": None,
+                "worker_name": None,
+                "job_id_short": ticket_id[:8],
+                "start_time": time.time(),
+            }
+        JOB_QUEUE.put(ticket_id)
+        print(f"[INFO] Test task created | ticket_id={ticket_id}")
+    
     main(args.port, args.workers)
