@@ -21,7 +21,7 @@ def _find_free_port():
     raise RuntimeError("No free port found between 8000 and 9999")
 
 
-def _is_server_ready(port, retries=30, delay=0.5):
+def _is_server_ready(port, retries=60, delay=1.0):
     """Check if the server is accepting connections on the given port."""
     for _ in range(retries):
         try:
@@ -43,13 +43,13 @@ def encode_server():
     base_url = f"http://127.0.0.1:{port}"
 
     def run_server():
-        srv.main(port=port, num_workers=3)
+        srv.main(port=port, num_workers=3, quiet=True, verbose=True)
 
     server_thread = threading.Thread(target=run_server, daemon=True, name="EncodeServer")
     server_thread.start()
 
     if not _is_server_ready(port):
-        pytest.fail("Encoding server failed to start within 15 seconds")
+        pytest.fail("Encoding server failed to start within 60 seconds")
 
     yield base_url
 
@@ -71,7 +71,7 @@ def _poll_status(base_url, ticket_id, timeout=120, interval=0.5):
 
     start = time.time()
     while time.time() - start < timeout:
-        response = requests.get(f"{base_url}/encode/status/{ticket_id}")
+        response = requests.get(f"{base_url}/status/{ticket_id}")
         assert response.status_code == 200, f"Status request failed: {response.text}"
         data = response.json()
 
@@ -97,7 +97,7 @@ def test_start_and_complete_job(encode_server):
         files = {"input_file": ("sample.mp4", f, "video/mp4")}
         data = {"options": json.dumps({"ffmpeg_preset": "ultrafast"})}
 
-        response = requests.post(f"{base_url}/encode/start", files=files, data=data)
+        response = requests.post(f"{base_url}/start/encode", files=files, data=data)
 
     assert response.status_code == 200
     ticket_id = response.json()["ticket_id"]
@@ -110,7 +110,7 @@ def test_start_and_complete_job(encode_server):
 
     # Step 3: Download the encoded file
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-        dl_response = requests.get(f"{base_url}/encode/result/{ticket_id}")
+        dl_response = requests.get(f"{base_url}/result/{ticket_id}")
         assert dl_response.status_code == 200
         assert "attachment" in dl_response.headers.get("Content-Disposition", "")
         tmp.write(dl_response.content)
@@ -141,7 +141,7 @@ def test_upload_without_file_returns_400(encode_server):
 
     base_url = encode_server
 
-    response = requests.post(f"{base_url}/encode/start")
+    response = requests.post(f"{base_url}/start/encode")
     assert response.status_code == 400
 
     body = response.json()
@@ -155,7 +155,7 @@ def test_invalid_ticket_status_404(encode_server):
 
     base_url = encode_server
 
-    response = requests.get(f"{base_url}/encode/status/00000000-0000-0000-0000-000000000000")
+    response = requests.get(f"{base_url}/status/00000000-0000-0000-0000-000000000000")
     assert response.status_code == 404
     assert "error" in response.json()
 
@@ -166,7 +166,56 @@ def test_invalid_ticket_result_400(encode_server):
 
     base_url = encode_server
 
-    response = requests.get(f"{base_url}/encode/result/00000000-0000-0000-0000-000000000000")
+    response = requests.get(f"{base_url}/result/00000000-0000-0000-0000-000000000000")
     assert response.status_code == 400
     assert "error" in response.json()
+
+
+def test_start_and_complete_defreeze_job(encode_server):
+    """End-to-end: upload a video, defreeze it, download the result."""
+    import requests
+
+    base_url = encode_server
+
+    # Step 1: Upload for defreezing
+    with open("sample_2.mp4", "rb") as f:
+        files = {"input_file": ("sample_2.mp4", f, "video/mp4")}
+        data = {"options": json.dumps({"force_encode": True})}
+
+        response = requests.post(f"{base_url}/start/defreeze", files=files, data=data)
+
+    assert response.status_code == 200
+    ticket_id = response.json()["ticket_id"]
+    assert response.json()["status"] == "queued"
+
+    # Step 2: Wait for the job to complete
+    status_data = _poll_status(base_url, ticket_id)
+    assert status_data["status"] == "done", f"Defreeze failed: {status_data.get('error')}"
+    assert float(status_data["progress"]) == 100.0
+
+    # Step 3: Download the processed file
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        dl_response = requests.get(f"{base_url}/result/{ticket_id}")
+        assert dl_response.status_code == 200
+        assert "attachment" in dl_response.headers.get("Content-Disposition", "")
+        tmp.write(dl_response.content)
+        downloaded_path = tmp.name
+
+    # Step 4: Verify the downloaded file is a valid video with streams
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "quiet",
+            "-print_format", "json",
+            "-show_streams", str(downloaded_path)
+        ], capture_output=True, text=True
+    )
+
+    assert result.returncode == 0, f"ffprobe failed: {result.stderr}"
+    probe_data = json.loads(result.stdout)
+
+    streams = probe_data.get("streams", [])
+    assert len(streams) >= 1, "Output file has no streams"
+
+    video_streams = [s for s in streams if s["codec_type"] == "video"]
+    assert len(video_streams) >= 1, f"No video stream found in output.\n{probe_data}"
 

@@ -17,7 +17,6 @@ if platform.system() == 'Windows':
     kernel32 = ctypes.windll.kernel32
     kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
 
-
 import handlers
 
 from flask import Flask, request, jsonify, send_file, after_this_request
@@ -72,14 +71,18 @@ def job_worker():
         finally:
             JOB_QUEUE.task_done()
 
-@app.route("/encode/start", methods=["POST"])
-def encode_start():
+
+@app.route("/start/<task_type>", methods=["POST"])
+def start_task(task_type):
     try:
+        if task_type.upper() not in handlers.HANDLER_CLASSES:
+            return jsonify({"error": f"Unknown task type: {task_type}"}), 400
+
         ticket_id = str(uuid.uuid4())
         job_folder = TEMP_DIR / ticket_id
         job_folder.mkdir(parents=True, exist_ok=True)
 
-        logging.warning(f"[encode_start] New job created | ticket_id={ticket_id} folder={job_folder}")
+        logging.warning(f"[{task_type}_start] New job created | ticket_id={ticket_id} folder={job_folder}")
 
         input_file = request.files.get("input_file")
         if not input_file:
@@ -88,13 +91,13 @@ def encode_start():
         input_path = job_folder / "input_file"
         input_file.save(input_path)
         file_size = input_path.stat().st_size
-        logging.warning(f"[encode_start] Input received | filename={input_file.filename} size={file_size}")
+        logging.warning(f"[{task_type}_start] Input received | filename={input_file.filename} size={file_size}")
 
         srt_file = request.files.get("srt_file")
         if srt_file:
             srt_path = job_folder / "input.srt"
             srt_file.save(srt_path)
-            logging.warning(f"[encode_start] SRT received | filename={srt_file.filename}")
+            logging.warning(f"[{task_type}_start] SRT received | filename={srt_file.filename}")
 
         options_raw = request.form.get("options", "{}")
         try:
@@ -111,7 +114,7 @@ def encode_start():
         with JOBS_LOCK:
             JOBS[ticket_id] = {
                 "ticket_id": ticket_id,
-                "task_type": "ENCODE",
+                "task_type": task_type.upper(),
                 "status": "queued",
                 "progress": None,
                 "folder": job_folder,
@@ -130,8 +133,8 @@ def encode_start():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/encode/status/<ticket_id>", methods=["GET"])
-def encode_status(ticket_id):
+@app.route("/status/<ticket_id>", methods=["GET"])
+def get_status(ticket_id):
     with JOBS_LOCK:
         job = dict(JOBS.get(ticket_id, {}))
         if not job or "status" not in job:
@@ -165,18 +168,18 @@ def encode_status(ticket_id):
     return jsonify(response)
 
 
-@app.route("/encode/result/<ticket_id>", methods=["GET"])
-def encode_result(ticket_id):
+@app.route("/result/<ticket_id>", methods=["GET"])
+def get_result(ticket_id):
     with JOBS_LOCK:
         job = dict(JOBS.get(ticket_id, {}))
         if not job or "status" not in job or job["status"] != "done":
-            logging.warning(f"[encode_result] Invalid request | ticket_id={ticket_id} status={job.get('status', 'N/A')}")
+            logging.warning(f"[get_result] Invalid request | ticket_id={ticket_id} status={job.get('status', 'N/A')}")
             return jsonify({"error": "Job not completed"}), 400
 
         output_file = job.get("output_file")
         folder = job.get("folder")
         if not output_file or not folder:
-            logging.warning(f"[encode_result] Missing data | ticket_id={ticket_id} output_file={output_file}")
+            logging.warning(f"[get_result] Missing data | ticket_id={ticket_id} output_file={output_file}")
             return jsonify({"error": "Job not completed"}), 400
 
     @after_this_request
@@ -219,9 +222,9 @@ ASCII_LOGO = """
 ░██         ░██░██   ░██   ░██ ░██   ░██    ░█████████ ░██    ░██    ░██  ░██  ░██ ░█████████ ░██    ░██ ░██ ░███████  
 ░██         ░██░██   ░██   ░██ ░██   ░██    ░██        ░██   ░███    ░██       ░██ ░██        ░██   ░███ ░██░██   ░██  
 ░██████████ ░██░██   ░██   ░██ ░██    ░████  ░███████   ░█████░██    ░██       ░██  ░███████   ░█████░██ ░██ ░█████░██ 
-                                                                                                                       
-                                                                                                                       
-                                                                                                                       
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
 ░██████████                                         ░██                                                                
 ░██                                                 ░██                                                                
 ░██         ░████████   ░███████   ░███████   ░████████  ░███████  ░██░████                                            
@@ -325,7 +328,7 @@ def status_monitor():
 # -------------------------------
 # App Startup
 # -------------------------------
-def setup_logging(base_dir):
+def setup_logging(base_dir, verbose: bool = False):
     log_file = base_dir / "server.log"
     log1_file = base_dir / "server1.log"
 
@@ -336,25 +339,30 @@ def setup_logging(base_dir):
         log_file.rename(log1_file)
 
     fmt = logging.Formatter('[%(asctime)s] %(levelname)s - %(name)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    level = logging.DEBUG if verbose else logging.WARNING
 
     handler_current = logging.FileHandler(log_file, mode='w')
-    handler_current.setLevel(logging.WARNING)
+    handler_current.setLevel(level)
     handler_current.setFormatter(fmt)
-    logging.getLogger().setLevel(logging.WARNING)
-    logging.getLogger().addHandler(handler_current)
 
-def main(port: int = 8080, num_workers: int = 3):
-    setup_logging(BASE_DIR)
+    root = logging.getLogger()
+    root.setLevel(level)
+    root.addHandler(handler_current)
+
+
+def main(port: int = 8080, num_workers: int = 3, quiet: bool = False, verbose: bool = False):
+    setup_logging(BASE_DIR, verbose=verbose)
 
     for i in range(num_workers):
         t = threading.Thread(target=job_worker, daemon=True, name=f"JobWorker-{i + 1}")
         t.start()
 
-    print_banner()
-    
-    mon = threading.Thread(target=status_monitor, daemon=True, name='StatusMonitor')
-    mon.start()
-    logging.warning('[INFO] Status monitor started')
+    if not quiet:
+        print_banner()
+
+        mon = threading.Thread(target=status_monitor, daemon=True, name='StatusMonitor')
+        mon.start()
+        logging.warning('[INFO] Status monitor started')
 
     logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
@@ -368,8 +376,9 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8080, help="Port to run the server on")
     parser.add_argument("--workers", type=int, default=3, help="Number of background encoding threads")
     parser.add_argument("--test", action="store_true", help="Create a simulated test task for progress/status testing")
+    parser.add_argument("--verbose", action="store_true", help="Log at DEBUG level to server.log")
     args = parser.parse_args()
-    
+
     if args.test:
         ticket_id = str(uuid.uuid4())
         job_folder = TEMP_DIR / ticket_id
@@ -390,4 +399,4 @@ if __name__ == "__main__":
         JOB_QUEUE.put(ticket_id)
         print(f"[INFO] Test task created | ticket_id={ticket_id}")
     
-    main(args.port, args.workers)
+    main(args.port, args.workers, verbose=args.verbose)
